@@ -39,11 +39,12 @@ _TOP_K        = 4
 _ENV_FILE     = os.path.join(os.path.dirname(os.path.abspath(__file__)), "..", ".webui_admin.env")
 
 _SYSTEM = (
-    "You are a precise document analysis assistant. "
-    "Answer the user's question using ONLY the provided document excerpts. "
-    "If the information is not found in the excerpts, say: "
-    "'I could not find that information in the uploaded document.' "
-    "Cite page numbers when available. Be concise and factual."
+    "You are an expert SEBI compliance assistant. "
+    "Provide a detailed, comprehensive explanation to the user's question using ONLY the provided document excerpts. "
+    "If the information is not found in the excerpts, clearly state: "
+    "'I could not find that information in the uploaded documents.' "
+    "Always cite the circular number, clause number, and page numbers when available in the text. "
+    "Do not stop in the middle of a thought; provide complete, well-rounded answers."
 )
 
 
@@ -139,46 +140,24 @@ def _query_webui_collections(
 def _extract_collection_names(body: dict) -> List[str]:
     """
     Extract ChromaDB collection names from Open-WebUI's body structure.
-
-    Open-WebUI passes files in body["files"] as objects like:
-      { "type": "doc", "doc": { "collection_name": "...", "name": "..." } }
-    OR:
-      { "collection_name": "...", "name": "..." }
-    OR in body["metadata"]["files"]
+    This recursively searches the body for any 'collection_name' or 'collection_names' keys.
     """
     collections = []
 
-    def _from_obj(obj):
+    def _search(obj):
         if isinstance(obj, dict):
-            # Direct collection_name key
-            col = obj.get("collection_name")
-            if col:
-                collections.append(col)
-                return
-            # Nested under "doc"
-            doc = obj.get("doc", {})
-            if isinstance(doc, dict):
-                col = doc.get("collection_name")
-                if col:
-                    collections.append(col)
+            for k, v in obj.items():
+                if k == "collection_name" and isinstance(v, str):
+                    collections.append(v)
+                elif k == "collection_names" and isinstance(v, list):
+                    collections.extend([x for x in v if isinstance(x, str)])
+                else:
+                    _search(v)
+        elif isinstance(obj, list):
+            for item in obj:
+                _search(item)
 
-    # Check body["files"]
-    for f in body.get("files", []):
-        _from_obj(f)
-
-    # Check body["metadata"]["files"]
-    meta = body.get("metadata", {})
-    for f in meta.get("files", []):
-        _from_obj(f)
-
-    # Check messages for file content blocks
-    for msg in body.get("messages", []):
-        content = msg.get("content", "")
-        if isinstance(content, list):
-            for part in content:
-                if isinstance(part, dict) and part.get("type") in ("doc", "file"):
-                    _from_obj(part)
-                    _from_obj(part.get("doc", {}))
+    _search(body)
 
     # De-duplicate while preserving order
     seen = set()
@@ -194,7 +173,7 @@ def _extract_collection_names(body: dict) -> List[str]:
         # Debug: dump body structure keys so we can diagnose missing files
         print(f"[DocQA] WARNING: No collections found. body keys: {list(body.keys())}")
         files = body.get("files", [])
-        print(f"[DocQA] body['files'] ({len(files)} items): {json.dumps(files, default=str)[:500]}")
+        print(f"[DocQA] metadata: {json.dumps(body.get('metadata', {}), default=str)}")
 
     return unique
 
@@ -274,6 +253,13 @@ class Pipe:
         user_msg = _get_user_message(body)
         if not user_msg:
             user_msg = body.get("prompt", "")
+
+        # ── Debug body ────────────────────────────────────────────
+        try:
+            with open(os.path.join(os.path.dirname(__file__), "debug_body.json"), "w") as f:
+                json.dump(body, f, indent=2, default=str)
+        except Exception as e:
+            print(f"[DocQA] Could not dump body: {e}")
 
         # ── Find uploaded file collections ────────────────────────────
         collection_names = _extract_collection_names(body)
