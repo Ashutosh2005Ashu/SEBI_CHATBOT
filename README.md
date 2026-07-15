@@ -19,6 +19,26 @@ A local, private PDF question-answering chatbot powered by:
    ollama pull nomic-embed-text
    ```
 
+### Installation & Setup
+
+1. **Create a virtual environment**:
+   ```powershell
+   python -m venv venv
+   ```
+2. **Activate the virtual environment**:
+   * **Windows (PowerShell)**:
+     ```powershell
+     .\venv\Scripts\Activate.ps1
+     ```
+   * **macOS/Linux**:
+     ```bash
+     source venv/bin/activate
+     ```
+3. **Install the dependencies**:
+   ```powershell
+   pip install -r requirements.txt
+   ```
+
 ### Launch
 Double-click `start.bat` or run from PowerShell:
 ```powershell
