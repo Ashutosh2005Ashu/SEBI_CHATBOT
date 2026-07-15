@@ -1,0 +1,19 @@
+# ============================================================
+# Document QA Chatbot — Dependencies
+# ============================================================
+
+# Core Chat Interface
+open-webui==0.10.2
+
+# Vector Database for RAG
+chromadb==1.5.9
+
+# Document Chunking and Processing
+langchain-text-splitters==1.1.2
+
+# HTTP Clients for API integration
+requests==2.34.2
+httpx==0.28.1
+
+# Data Validation and Settings
+pydantic==2.13.4
