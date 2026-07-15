@@ -36,10 +36,10 @@ set OLLAMA_BASE_URL=http://localhost:11434
 set RAG_OLLAMA_BASE_URL=http://localhost:11434
 
 :: Chunking strategy tuned for gemma2:2b 8k context window
-:: 1900 chars ≈ 512 tokens | overlap 240 ≈ 64 tokens | top-k=4 → ~2048 tokens retrieved
-set CHUNK_SIZE=1900
-set CHUNK_OVERLAP=240
-set TOP_K=4
+:: 1500 chars ≈ 400 tokens | overlap 200 ≈ 50 tokens | top-k=6 → ~2400 tokens retrieved
+set CHUNK_SIZE=1500
+set CHUNK_OVERLAP=200
+set TOP_K=6
 
 :: Disable features that trigger tool-calling (not supported by gemma2:2b)
 set ENABLE_RAG_WEB_SEARCH=False
@@ -47,9 +47,12 @@ set ENABLE_WEB_SEARCH=False
 set ENABLE_SEARCH_QUERY_GENERATION=False
 set ENABLE_RETRIEVAL_QUERY_GENERATION=False
 
-:: Use PDF extraction without image analysis (faster, simpler)
-set PDF_EXTRACT_IMAGES=False
-set ENABLE_RAG_HYBRID_SEARCH=False
+:: Enable image extraction from PDFs (OCR for scanned documents)
+set PDF_EXTRACT_IMAGES=True
+set ENABLE_RAG_HYBRID_SEARCH=True
+
+:: Content extraction engine (default uses PyPDF, tika adds OCR support)
+set CONTENT_EXTRACTION_ENGINE=default
 
 :: ============================================================
 echo.
