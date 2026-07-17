@@ -89,16 +89,21 @@ def _load_admin_token() -> Optional[str]:
 # Retrieval via Open-WebUI's internal API
 # ---------------------------------------------------------------------------
 
+# Each retrieved chunk is returned as (text, metadata_dict)
+_Chunk = Tuple[str, dict]
+
+
 def _query_webui_collections(
     collection_names: List[str],
     query: str,
     top_k: int,
     token: str,
     webui_url: str,
-) -> List[str]:
+) -> List["_Chunk"]:
     """
     Query Open-WebUI's own vector store for relevant chunks.
-    This uses the same collection that Open-WebUI created when the user uploaded the file.
+    Returns a list of (document_text, metadata_dict) tuples so that
+    downstream re-ranking can use file_id for the created_at fallback.
     """
     if not collection_names or not token:
         return []
@@ -110,7 +115,6 @@ def _query_webui_collections(
     }
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
 
-    # Try the retrieval endpoint
     endpoints = [
         f"{webui_url}/api/v1/retrieval/query/collection",
         f"{webui_url}/api/v1/rag/query/collection",
@@ -121,17 +125,20 @@ def _query_webui_collections(
             r = requests.post(url, headers=headers, json=payload, timeout=30)
             if r.status_code == 200:
                 data = r.json()
-                # Response shape: {"results": [{"documents": [[...]], ...}]}
-                # OR: {"documents": [[...]], ...}
-                chunks = []
                 results = data.get("results", [data])
+                chunks: List[_Chunk] = []
                 for result in results:
-                    docs = result.get("documents", [])
-                    for doc_list in docs:
+                    docs      = result.get("documents", [])
+                    metas     = result.get("metadatas", [])
+                    for i, doc_list in enumerate(docs):
+                        meta_list = metas[i] if i < len(metas) else []
                         if isinstance(doc_list, list):
-                            chunks.extend(d for d in doc_list if d)
+                            for j, d in enumerate(doc_list):
+                                if d:
+                                    meta = meta_list[j] if j < len(meta_list) else {}
+                                    chunks.append((d, meta if isinstance(meta, dict) else {}))
                         elif doc_list:
-                            chunks.append(doc_list)
+                            chunks.append((doc_list, {}))
                 if chunks:
                     print(f"[DocQA] Retrieved {len(chunks)} chunks from {url}")
                     return chunks
@@ -249,26 +256,71 @@ def _extract_circular_date(text: str) -> Tuple[datetime, str]:
     return datetime.min, "unknown"
 
 
-def _rerank_by_date(chunks: List[str]) -> List[str]:
+def _get_file_created_at_map(file_ids: List[str]) -> dict:
     """
-    Sort retrieved chunks newest-first and prepend a [Source date: ...] label
-    so the LLM can reason about recency.
+    Query webui.db for file.created_at (Unix timestamp) for a set of file_ids.
+    Used as a fallback date when a chunk contains no parseable circular date.
+    Returns {file_id: datetime} for any file_id found in the DB.
     """
-    if not chunks:
-        return chunks
+    if not file_ids:
+        return {}
+    db_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "data", "webui.db"
+    )
+    result = {}
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        placeholders = ",".join("?" * len(file_ids))
+        rows = conn.execute(
+            f"SELECT id, created_at FROM file WHERE id IN ({placeholders})",
+            file_ids,
+        ).fetchall()
+        conn.close()
+        for fid, ts in rows:
+            if ts:
+                result[fid] = datetime.utcfromtimestamp(int(ts))
+    except Exception as e:
+        print(f"[DocQA] DB fallback lookup failed: {e}")
+    return result
+
+
+def _rerank_by_date(chunk_tuples: List["_Chunk"]) -> List[str]:
+    """
+    Sort retrieved chunks newest-first using:
+      1. Primary  — circular date extracted from the chunk text via regex
+      2. Fallback — file.created_at from webui.db (upload time)
+      3. Last resort — datetime.min (chunk floats to the bottom)
+
+    Returns plain text strings with a [Source date: ...] label prepended.
+    """
+    if not chunk_tuples:
+        return []
+
+    # Collect all unique file_ids so we can batch-query the DB
+    file_ids = list({
+        meta.get("file_id", "") for _, meta in chunk_tuples if meta.get("file_id")
+    })
+    created_at_map = _get_file_created_at_map(file_ids)
 
     dated: List[Tuple[datetime, str, str]] = []
-    for chunk in chunks:
-        dt, display = _extract_circular_date(chunk)
-        dated.append((dt, display, chunk))
+    for text, meta in chunk_tuples:
+        dt, display = _extract_circular_date(text)
+        if dt == datetime.min:
+            # Fallback: use DB upload timestamp for this file
+            fid = meta.get("file_id", "")
+            if fid and fid in created_at_map:
+                dt      = created_at_map[fid]
+                display = f"~{dt.strftime('%b %d %Y')} (upload date)"
+        dated.append((dt, display, text))
 
-    # Sort descending: newest date first
+    # Sort descending: newest first
     dated.sort(key=lambda x: x[0], reverse=True)
 
     reranked = []
-    for dt, display, chunk in dated:
+    for dt, display, text in dated:
         label = f"[Source date: {display}]\n"
-        reranked.append(label + chunk)
+        reranked.append(label + text)
 
     print(
         f"[DocQA] Re-ranked {len(reranked)} chunks by date. "
@@ -351,14 +403,14 @@ class Pipe:
         collection_names = _extract_collection_names(body)
 
         # ── Retrieve chunks ───────────────────────────────────────────
-        chunks: List[str] = []
+        chunk_tuples: List[_Chunk] = []
         if collection_names:
-            chunks = _query_webui_collections(
+            chunk_tuples = _query_webui_collections(
                 collection_names, user_msg, v.top_k, tok, v.webui_base_url
             )
-            # Re-rank by circular date so newest information is presented first
-            if chunks:
-                chunks = _rerank_by_date(chunks)
+
+        # Re-rank by circular date (with DB fallback) so newest info comes first
+        chunks: List[str] = _rerank_by_date(chunk_tuples) if chunk_tuples else []
 
         # ── Build Ollama messages ─────────────────────────────────────
         ollama_msgs = [{"role": "system", "content": _SYSTEM}]
