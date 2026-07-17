@@ -1,19 +1,47 @@
 # ============================================================
-# Document QA Chatbot — Dependencies
+# SEBI Document QA Chatbot — Python Dependencies
+# ============================================================
+# Install with: pip install -r requirements.txt
+#
+# Prerequisites (NOT installed via pip — install separately):
+#   - Python 3.11+         https://www.python.org/downloads/
+#   - Ollama               https://ollama.com/download
+#     Then pull models:
+#       ollama pull gemma2:2b
+#       ollama pull qwen3-8b          (optional, for Qwen pipeline)
+#       ollama pull nomic-embed-text  (required for RAG embeddings)
 # ============================================================
 
-# Core Chat Interface
+# ── Core Chat Interface ───────────────────────────────────────
+# Open-WebUI bundles ChromaDB, FastAPI, SQLAlchemy, Alembic,
+# langchain-text-splitters, sentence-transformers and most other
+# dependencies as transitive deps — so this single line is the
+# most important one.
 open-webui==0.10.2
 
-# Vector Database for RAG
+# ── HTTP Clients (used by pipeline functions & setup scripts) ─
+# httpx  : async streaming calls to Ollama inside pipeline funcs
+# requests: sync REST calls in setup_webui.py / utility scripts
+httpx==0.28.1
+requests==2.34.2
+
+# ── Data Validation (used by pipeline Valves / BaseModel) ────
+pydantic==2.13.4
+
+# ── The following are already pulled in by open-webui but are ─
+# ── pinned here explicitly for reproducibility ────────────────
+
+# Vector database (bundled inside open-webui's data dir)
 chromadb==1.5.9
 
-# Document Chunking and Processing
+# Text chunking for document ingestion
 langchain-text-splitters==1.1.2
 
-# HTTP Clients for API integration
-requests==2.34.2
-httpx==0.28.1
+# PDF / document parsing (used by open-webui's RAG ingestion)
+pypdf==6.7.5
 
-# Data Validation and Settings
-pydantic==2.13.4
+# Sentence embeddings & hybrid search reranking
+sentence-transformers==5.5.1
+
+# ASGI server that open-webui launches with
+uvicorn==0.41.0
