@@ -22,8 +22,10 @@ Context window budget for gemma2:2b (8192 tokens):
 
 import json
 import os
+import re
 import time
-from typing import Generator, Iterator, List, Optional, Union
+from datetime import datetime
+from typing import Generator, Iterator, List, Optional, Tuple, Union
 
 import httpx
 import requests
@@ -44,6 +46,9 @@ _SYSTEM = (
     "If the information is not found in the excerpts, clearly state: "
     "'I could not find that information in the uploaded documents.' "
     "Always cite the circular number, clause number, and page numbers when available in the text. "
+    "IMPORTANT: When multiple excerpts discuss the same topic with different or conflicting rules, "
+    "you MUST follow and cite the MOST RECENTLY DATED circular. "
+    "Each excerpt is prefixed with its detected date in [Source date: ...] format — use this to determine recency. "
     "Do not stop in the middle of a thought; provide complete, well-rounded answers."
 )
 
@@ -192,12 +197,93 @@ def _get_user_message(body: dict) -> str:
     return ""
 
 
+# ---------------------------------------------------------------------------
+# Date extraction & re-ranking helpers
+# ---------------------------------------------------------------------------
+
+# Matches formats found in SEBI circular headers, e.g.:
+#   "March 22, 2021"  |  "22nd March, 2021"  |  "22/03/2021"  |  "2021-03-22"
+_DATE_PATTERNS: List[Tuple[str, str]] = [
+    # "March 22, 2021" or "March 22 2021"
+    (r"\b(January|February|March|April|May|June|July|August|September|October|November|December)\s+(\d{1,2})[,\s]\s*(\d{4})\b",
+     "%B %d %Y"),
+    # "22nd March, 2021" or "22 March 2021"
+    (r"\b(\d{1,2})(?:st|nd|rd|th)?\s+(January|February|March|April|May|June|July|August|September|October|November|December)[,\s]\s*(\d{4})\b",
+     "%d %B %Y"),
+    # "22/03/2021" or "22-03-2021"
+    (r"\b(\d{2})[/\-](\d{2})[/\-](\d{4})\b",
+     "%d/%m/%Y"),
+    # ISO: "2021-03-22"
+    (r"\b(\d{4})-(\d{2})-(\d{2})\b",
+     "ISO"),
+]
+
+
+def _extract_circular_date(text: str) -> Tuple[datetime, str]:
+    """
+    Scan chunk text for a SEBI circular date.
+    Returns (datetime_object, display_string).
+    Falls back to (datetime.min, "unknown") if nothing is found.
+    """
+    for pattern, fmt in _DATE_PATTERNS:
+        m = re.search(pattern, text, re.IGNORECASE)
+        if not m:
+            continue
+        try:
+            if fmt == "%B %d %Y":
+                # groups: month_name, day, year
+                date_str = f"{m.group(1)} {m.group(2)} {m.group(3)}"
+                return datetime.strptime(date_str, "%B %d %Y"), date_str
+            elif fmt == "%d %B %Y":
+                # groups: day, month_name, year
+                date_str = f"{m.group(1)} {m.group(2)} {m.group(3)}"
+                return datetime.strptime(date_str, "%d %B %Y"), date_str
+            elif fmt == "%d/%m/%Y":
+                date_str = f"{m.group(1)}/{m.group(2)}/{m.group(3)}"
+                return datetime.strptime(date_str, "%d/%m/%Y"), date_str
+            elif fmt == "ISO":
+                date_str = f"{m.group(1)}-{m.group(2)}-{m.group(3)}"
+                return datetime.strptime(date_str, "%Y-%m-%d"), date_str
+        except ValueError:
+            continue
+    return datetime.min, "unknown"
+
+
+def _rerank_by_date(chunks: List[str]) -> List[str]:
+    """
+    Sort retrieved chunks newest-first and prepend a [Source date: ...] label
+    so the LLM can reason about recency.
+    """
+    if not chunks:
+        return chunks
+
+    dated: List[Tuple[datetime, str, str]] = []
+    for chunk in chunks:
+        dt, display = _extract_circular_date(chunk)
+        dated.append((dt, display, chunk))
+
+    # Sort descending: newest date first
+    dated.sort(key=lambda x: x[0], reverse=True)
+
+    reranked = []
+    for dt, display, chunk in dated:
+        label = f"[Source date: {display}]\n"
+        reranked.append(label + chunk)
+
+    print(
+        f"[DocQA] Re-ranked {len(reranked)} chunks by date. "
+        f"Newest: {dated[0][1]}, Oldest: {dated[-1][1]}"
+    )
+    return reranked
+
+
 def _build_prompt(chunks: List[str], question: str) -> str:
     context = "\n\n---\n\n".join(chunks)
     return (
-        f"Document Excerpts:\n"
+        f"Document Excerpts (sorted newest circular first):\n"
         f"{context}\n\n"
         f"---\n\n"
+        f"REMINDER: If excerpts conflict, follow the MOST RECENT circular (highest [Source date]).\n\n"
         f"Question: {question}\n\n"
         f"Answer:"
     )
@@ -270,6 +356,9 @@ class Pipe:
             chunks = _query_webui_collections(
                 collection_names, user_msg, v.top_k, tok, v.webui_base_url
             )
+            # Re-rank by circular date so newest information is presented first
+            if chunks:
+                chunks = _rerank_by_date(chunks)
 
         # ── Build Ollama messages ─────────────────────────────────────
         ollama_msgs = [{"role": "system", "content": _SYSTEM}]
