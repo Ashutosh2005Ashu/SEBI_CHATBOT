@@ -271,29 +271,58 @@ def _build_date_queries(date_hint: Tuple[str, str]) -> List[str]:
     ]
 
 
+# Known SEBI-DOCS knowledge base UUID — used as last-resort fallback if DB lookup fails.
+# Update this if you recreate the knowledge base in Open-WebUI.
+_SEBI_DOCS_KB_ID = "159a8be8-bfe9-4354-9747-83cdb4f6817d"
+
+
+def _get_db_path() -> str:
+    """
+    Locate webui.db reliably when running inside Open-WebUI's function context.
+    Open-WebUI executes pipe functions dynamically, so __file__ points to a
+    temporary/virtual path. We resolve the real path using (in priority order):
+      1. DATA_DIR env variable  (set by start.bat: set DATA_DIR=%~dp0data)
+      2. __file__ relative path (works when running update_func.py directly)
+    """
+    data_dir = os.environ.get("DATA_DIR", "")
+    if data_dir:
+        candidate = os.path.join(data_dir, "webui.db")
+        if os.path.exists(candidate):
+            return candidate
+    base = os.path.dirname(os.path.abspath(__file__))
+    for rel in (os.path.join(base, "..", "data"), os.path.join(base, "data")):
+        candidate = os.path.join(rel, "webui.db")
+        if os.path.exists(candidate):
+            return candidate
+    return ""
+
+
 def _get_sebi_kb_collection() -> List[str]:
     """
-    Fallback: read the SEBI-DOCS knowledge base ID from webui.db.
+    Return the ChromaDB collection name for SEBI-DOCS.
+    Resolution order:
+      1. Query webui.db (most reliable, auto-updates if KB is recreated)
+      2. Hardcoded UUID _SEBI_DOCS_KB_ID (fallback if DB unreachable)
     Used when Open-WebUI does not pass collection names in the request body.
-    The collection name in ChromaDB equals the knowledge base UUID.
     """
-    db_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "data", "webui.db"
-    )
-    try:
-        import sqlite3
-        conn = sqlite3.connect(db_path)
-        row = conn.execute(
-            "SELECT id FROM knowledge WHERE name = 'SEBI-DOCS' LIMIT 1"
-        ).fetchone()
-        conn.close()
-        if row:
-            kb_id = row[0]
-            print(f"[DocQA-Qwen] Fallback KB collection from DB: {kb_id}")
-            return [kb_id]
-    except Exception as e:
-        print(f"[DocQA-Qwen] KB fallback lookup failed: {e}")
-    return []
+    db_path = _get_db_path()
+    if db_path:
+        try:
+            conn = sqlite3.connect(db_path)
+            row = conn.execute(
+                "SELECT id FROM knowledge WHERE name = 'SEBI-DOCS' LIMIT 1"
+            ).fetchone()
+            conn.close()
+            if row:
+                print(f"[DocQA-Qwen] KB collection from DB: {row[0]}")
+                return [row[0]]
+        except Exception as e:
+            print(f"[DocQA-Qwen] DB knowledge lookup failed: {e}")
+    else:
+        print(f"[DocQA-Qwen] webui.db not found (DATA_DIR={os.environ.get('DATA_DIR', 'not set')})")
+
+    print(f"[DocQA-Qwen] Using hardcoded SEBI-DOCS KB ID: {_SEBI_DOCS_KB_ID}")
+    return [_SEBI_DOCS_KB_ID]
 
 
 # ---------------------------------------------------------------------------
@@ -354,9 +383,9 @@ def _get_file_created_at_map(file_ids: List[str]) -> dict:
     """
     if not file_ids:
         return {}
-    db_path = os.path.join(
-        os.path.dirname(os.path.abspath(__file__)), "..", "data", "webui.db"
-    )
+    db_path = _get_db_path()
+    if not db_path:
+        return {}
     result = {}
     try:
         conn = sqlite3.connect(db_path)
@@ -370,7 +399,7 @@ def _get_file_created_at_map(file_ids: List[str]) -> dict:
             if ts:
                 result[fid] = datetime.utcfromtimestamp(int(ts))
     except Exception as e:
-        print(f"[DocQA-Qwen] DB fallback lookup failed: {e}")
+        print(f"[DocQA-Qwen] DB created_at lookup failed: {e}")
     return result
 
 
