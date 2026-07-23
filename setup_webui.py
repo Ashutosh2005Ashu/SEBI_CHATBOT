@@ -1,4 +1,4 @@
-﻿"""
+"""
 setup_webui.py
 ==============
 Auto-configures Open-WebUI after startup:
@@ -128,16 +128,38 @@ def auth_headers(token):
 # ---------------------------------------------------------------------------
 
 def upload_function(token):
-    """Upload document_qa_function.py as an Open-WebUI function."""
-    if not os.path.exists(FUNCTION_FILE):
-        print(f"[setup] âš ï¸  Function file not found: {FUNCTION_FILE}")
+    """Upload document_qa_function.py (gemma2:2b pipeline) as an Open-WebUI function."""
+    return _upload_any_function(
+        token,
+        func_file=FUNCTION_FILE,
+        func_id="document_qa_rag",
+        func_name="Document QA (RAG)",
+        description="RAG pipeline for PDF document QA using gemma2:2b. No tool-calling required.",
+    )
+
+
+def upload_qwen_function(token):
+    """Upload document_qa_qwen.py (qwen3-8b pipeline) as an Open-WebUI function."""
+    qwen_file = os.path.join(os.path.dirname(__file__), "pipelines", "document_qa_qwen.py")
+    return _upload_any_function(
+        token,
+        func_file=qwen_file,
+        func_id="document_qa_rag_qwen",
+        func_name="Document QA (RAG) - Qwen3-8B",
+        description="RAG pipeline for PDF document QA using qwen3-8b (32k context). No tool-calling required.",
+    )
+
+
+def _upload_any_function(token, func_file, func_id, func_name, description):
+    """Generic helper: upload or update any pipeline function file."""
+    if not os.path.exists(func_file):
+        print(f"[setup] Function file not found: {func_file}")
         return False
 
-    with open(FUNCTION_FILE, "r", encoding="utf-8") as f:
+    with open(func_file, "r", encoding="utf-8") as f:
         content = f.read()
 
     headers = auth_headers(token)
-    func_id = "document_qa_rag"
 
     # Check if function already exists
     r = requests.get(f"{WEBUI_URL}/api/v1/functions/", headers=headers, timeout=10)
@@ -147,15 +169,12 @@ def upload_function(token):
 
     payload = {
         "id":      func_id,
-        "name":    "ðŸ“„ Document QA (RAG)",
+        "name":    func_name,
         "content": content,
-        "meta": {
-            "description": "RAG pipeline for PDF document QA. No tool-calling required.",
-        },
+        "meta":    {"description": description},
     }
 
     if func_id in existing_ids:
-        # Update existing
         r = requests.post(
             f"{WEBUI_URL}/api/v1/functions/id/{func_id}/update",
             headers=headers,
@@ -163,7 +182,6 @@ def upload_function(token):
             timeout=15,
         )
     else:
-        # Create new
         r = requests.post(
             f"{WEBUI_URL}/api/v1/functions/create",
             headers=headers,
@@ -172,11 +190,12 @@ def upload_function(token):
         )
 
     if r.status_code == 200:
-        print("[setup] âœ… Function 'Document QA (RAG)' uploaded successfully.")
+        print(f"[setup] Function '{func_name}' uploaded successfully.")
         return True
     else:
-        print(f"[setup] âš ï¸  Function upload returned {r.status_code}: {r.text[:200]}")
+        print(f"[setup] Function upload returned {r.status_code}: {r.text[:200]}")
         return False
+
 
 
 # ---------------------------------------------------------------------------
