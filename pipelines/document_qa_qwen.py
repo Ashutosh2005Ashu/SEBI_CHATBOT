@@ -105,54 +105,73 @@ def _query_webui_collections(
     top_k: int,
     token: str,
     webui_url: str,
+    extra_queries: Optional[List[str]] = None,
 ) -> List["_Chunk"]:
     """
     Query Open-WebUI's own vector store for relevant chunks.
-    Returns a list of (document_text, metadata_dict) tuples so that
-    downstream re-ranking can use file_id for the created_at fallback.
+    Returns (document_text, metadata_dict) tuples.
+
+    Runs the main semantic query, then any extra_queries (keyword date queries)
+    and merges results, deduplicating by text content.
     """
     if not collection_names or not token:
         return []
 
-    payload = {
-        "collection_names": collection_names,
-        "query": query,
-        "k": top_k,
-    }
     headers = {"Authorization": f"Bearer {token}", "Content-Type": "application/json"}
-
     endpoints = [
         f"{webui_url}/api/v1/retrieval/query/collection",
         f"{webui_url}/api/v1/rag/query/collection",
         f"{webui_url}/rag/api/v1/query/collection",
     ]
-    for url in endpoints:
-        try:
-            r = requests.post(url, headers=headers, json=payload, timeout=30)
-            if r.status_code == 200:
-                data = r.json()
-                results = data.get("results", [data])
-                chunks: List[_Chunk] = []
-                for result in results:
-                    docs      = result.get("documents", [])
-                    metas     = result.get("metadatas", [])
-                    for i, doc_list in enumerate(docs):
-                        meta_list = metas[i] if i < len(metas) else []
-                        if isinstance(doc_list, list):
-                            for j, d in enumerate(doc_list):
-                                if d:
-                                    meta = meta_list[j] if j < len(meta_list) else {}
-                                    chunks.append((d, meta if isinstance(meta, dict) else {}))
-                        elif doc_list:
-                            chunks.append((doc_list, {}))
-                if chunks:
-                    print(f"[DocQA-Qwen] Retrieved {len(chunks)} chunks from {url}")
-                    return chunks
-        except Exception as e:
-            print(f"[DocQA-Qwen] Endpoint {url} failed: {e}")
-            continue
 
-    return []
+    def _run_single_query(q: str, k: int) -> List["_Chunk"]:
+        """Run one query against the first working endpoint and return chunks."""
+        payload = {"collection_names": collection_names, "query": q, "k": k}
+        for url in endpoints:
+            try:
+                r = requests.post(url, headers=headers, json=payload, timeout=30)
+                if r.status_code == 200:
+                    data    = r.json()
+                    results = data.get("results", [data])
+                    chunks: List[_Chunk] = []
+                    for result in results:
+                        docs  = result.get("documents", [])
+                        metas = result.get("metadatas", [])
+                        for i, doc_list in enumerate(docs):
+                            meta_list = metas[i] if i < len(metas) else []
+                            if isinstance(doc_list, list):
+                                for j, d in enumerate(doc_list):
+                                    if d:
+                                        meta = meta_list[j] if j < len(meta_list) else {}
+                                        chunks.append((d, meta if isinstance(meta, dict) else {}))
+                            elif doc_list:
+                                chunks.append((doc_list, {}))
+                    if chunks:
+                        return chunks
+            except Exception as e:
+                print(f"[DocQA-Qwen] Endpoint {url} failed: {e}")
+                continue
+        return []
+
+    # ── Main semantic query ───────────────────────────────────────────────────
+    all_chunks = _run_single_query(query, top_k)
+    print(f"[DocQA-Qwen] Semantic query returned {len(all_chunks)} chunks")
+
+    # ── Extra keyword queries (date-targeted) ─────────────────────────────────
+    if extra_queries:
+        seen_texts = {text for text, _ in all_chunks}
+        for eq in extra_queries:
+            extra = _run_single_query(eq, 4)   # top-4 per keyword query
+            added = 0
+            for text, meta in extra:
+                if text not in seen_texts:
+                    all_chunks.append((text, meta))
+                    seen_texts.add(text)
+                    added += 1
+            if added:
+                print(f"[DocQA-Qwen] Keyword query '{eq}' added {added} new chunks")
+
+    return all_chunks
 
 
 def _extract_collection_names(body: dict) -> List[str]:
@@ -206,6 +225,75 @@ def _get_user_message(body: dict) -> str:
                 )
             return str(content)
     return ""
+
+
+# ---------------------------------------------------------------------------
+# Query date detection & SEBI-DOCS KB fallback
+# ---------------------------------------------------------------------------
+
+def _extract_query_date(query: str) -> Optional[Tuple[str, str]]:
+    """
+    Detect a month+year date mention in the user's question.
+    Returns (month_name, year_str) or None.
+      "march 2021"       -> ("March", "2021")
+      "March 22, 2021"   -> ("March", "2021")
+      "03/2021"          -> ("March", "2021")
+    """
+    # Named month + optional day + year
+    m = re.search(
+        r"\b(January|February|March|April|May|June|July|August"
+        r"|September|October|November|December)"
+        r"(?:[,\s]+\d{1,2}[,\s]+|\s+)(\d{4})\b",
+        query, re.IGNORECASE,
+    )
+    if m:
+        return m.group(1).capitalize(), m.group(2)
+    # Numeric  MM/YYYY or MM-YYYY
+    m2 = re.search(r"\b(0?[1-9]|1[0-2])[/\-](\d{4})\b", query)
+    if m2:
+        months = ["January","February","March","April","May","June",
+                  "July","August","September","October","November","December"]
+        return months[int(m2.group(1)) - 1], m2.group(2)
+    return None
+
+
+def _build_date_queries(date_hint: Tuple[str, str]) -> List[str]:
+    """
+    Build targeted keyword queries from a (month_name, year) hint.
+    These supplement the main semantic query so that circular header
+    chunks containing only the date are also retrieved.
+    """
+    month, year = date_hint
+    return [
+        f"{month} {year}",                   # "March 2021"
+        f"CIR/P/{year}",                      # SEBI circular number pattern
+        f"SEBI circular {month} {year}",      # "SEBI circular March 2021"
+    ]
+
+
+def _get_sebi_kb_collection() -> List[str]:
+    """
+    Fallback: read the SEBI-DOCS knowledge base ID from webui.db.
+    Used when Open-WebUI does not pass collection names in the request body.
+    The collection name in ChromaDB equals the knowledge base UUID.
+    """
+    db_path = os.path.join(
+        os.path.dirname(os.path.abspath(__file__)), "..", "data", "webui.db"
+    )
+    try:
+        import sqlite3
+        conn = sqlite3.connect(db_path)
+        row = conn.execute(
+            "SELECT id FROM knowledge WHERE name = 'SEBI-DOCS' LIMIT 1"
+        ).fetchone()
+        conn.close()
+        if row:
+            kb_id = row[0]
+            print(f"[DocQA-Qwen] Fallback KB collection from DB: {kb_id}")
+            return [kb_id]
+    except Exception as e:
+        print(f"[DocQA-Qwen] KB fallback lookup failed: {e}")
+    return []
 
 
 # ---------------------------------------------------------------------------
@@ -402,14 +490,25 @@ class Pipe:
         except Exception as e:
             print(f"[DocQA-Qwen] Could not dump body: {e}")
 
-        # ── Find uploaded file collections ────────────────────────────
+        # ── Find uploaded file collections ────────────────────────────────────
         collection_names = _extract_collection_names(body)
+
+        # Fallback: if body had no collections, read SEBI-DOCS KB from DB
+        if not collection_names:
+            collection_names = _get_sebi_kb_collection()
+
+        # ── Detect date in question for targeted retrieval ──────────────────────
+        date_hint    = _extract_query_date(user_msg)
+        extra_queries: List[str] = _build_date_queries(date_hint) if date_hint else []
+        if date_hint:
+            print(f"[DocQA-Qwen] Date detected in query: {date_hint[0]} {date_hint[1]}")
 
         # ── Retrieve chunks ───────────────────────────────────────────
         chunk_tuples: List[_Chunk] = []
         if collection_names:
             chunk_tuples = _query_webui_collections(
-                collection_names, user_msg, v.top_k, tok, v.webui_base_url
+                collection_names, user_msg, v.top_k, tok, v.webui_base_url,
+                extra_queries=extra_queries,
             )
 
         # Re-rank by circular date (with DB fallback) so newest info comes first
